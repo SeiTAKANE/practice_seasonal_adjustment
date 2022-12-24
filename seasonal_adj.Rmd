@@ -1,0 +1,231 @@
+---
+title: "状態空間モデルによるデータの季節調整"
+author: "SeiTAKANE"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## セットアップと季節調整の概要
+<br>
+
+- 使用パッケージ
+```{r setup }
+pacman::p_load(rstan, #stanとの連携用
+               bayesplot,#収束の可視化
+               ggfortify,#時系列分析用
+               tidyverse #データ整形、可視化
+               )
+```
+<br>
+
+- 使用データ
+  - 使用するデータ: 2002年10月から2017年3月までの月ごとの米国の国際線旅客数
+  - データ引用元: [米国交通統計局](https://www.transtats.bts.gov/Data_Elements.aspx)
+```{r data }
+#データセットの読み込み（今回は同一dirにデータを配置）
+pax <- read.csv("all_airlines_all_airports.csv")
+
+#時間を表す列をdate型に変更
+pax$Date <- as.Date(pax$Date)
+
+#分析のために変数名などを変更して、単位を100万単位にならしておく
+pax_int <- tibble(month =as.POSIXct(pax$Date),
+      pax_int =pax$Passengers_International/1000000)   
+
+#可視化で大枠の確認
+pax  %>%
+  ggplot()+
+  geom_line(aes(x = as.Date(Date),y =Passengers_International/1000000))+
+  scale_y_continuous(limits = c(0,25))+
+  scale_x_continuous(breaks = seq(min(pax$Date),max(pax$Date),by ="year"))+
+  labs(x = "月",y = "月間旅客数(100万人)",title = "米国国際線旅客の変動")+
+  theme_gray (base_family = "HiraKakuPro-W3")+#mac使用のためフォント指定
+  theme(axis.text.x = element_text(angle = 75, vjust = 0.5))
+
+```
+<br>
+
+- 季節調整モデルの概要（モデルのコードによる定義は"seasonal_adj.stan"を参考）
+  - トレンド成分 (μ): 1時点前の状態との差分値が正規ホワイトノイズに従うことを仮定
+  - 季節性成分 (γ): 1年（12ヶ月)の合計値が正規ホワイトノイズに従うことを仮定
+  - 確率成分 (σ): ホワイトノイズを仮定
+  - 状態推定値(α): トレンド成分 + 季節性成分
+  - 観測値(y): トレンド成分 (μ) + 季節性成分 (γ) + 確率成分 (σ)
+- 最終的な操作として,モデルから季節性成分を除外した状態推定値を抜き出す
+
+<br>
+<br>
+
+$$
+\begin{aligned}
+  \mu_t      & \sim \text{Normal} (2 \mu_{t-1} - \mu_{t-2}, \sigma^2_{\xi}), \\
+  \gamma_t      & \sim \text{Normal} (- \sum_{t-11}^{t-1} \gamma_i, \sigma^2_{s}), \\
+ 	\alpha_t      & = \mu_t + \gamma_t , \\
+ y_t      &  \sim \text{Normal} (\alpha_t, \sigma^2_{v})
+\end{aligned}
+$$
+<br>
+
+## 実装
+<br>
+
+- 移動平均法による季節調整
+  - 比較としてまずは、移動平均法(12ヶ月)を行っておく
+```{r mv_12 }
+mv_12 <- c()
+for(i in 1:(length(pax_int$pax_int)-11)){
+  start <- i
+  end <- i+11
+  mv_12[i] <- sum(pax_int$pax_int[start:end])/12
+}
+pax_int$mv_12 <- NA
+pax_int$mv_12[12:length(pax_int$pax_int)] <- mv_12
+```
+
+<br>
+
+- 状態空間モデルの実装（処理内容は"seasonal_adj.stan"を参照）
+```{r ssm, echo=TRUE}
+#データのリスト格納
+data_list <- list(
+  y = pax_int$pax_int,
+  T = nrow(pax_int)
+)
+
+#モデルの実装
+#計算の高速化のため
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+#stanの実行
+pax_seasonal_adj <- stan(
+  file = "seasonal_adj.stan", #処理をさせるstan_file
+  data = data_list, #データ
+  seed = 1,#乱数の種
+  chains = 4, #チェーン数
+  thin = 6, #間引き数
+  iter = 8000, #乱数の繰り返し回数
+  warmup = 5000, #バーンイン回数
+  control = list(adapt_delta = 0.98, max_treedepth = 15)#事後分布の受け入れ確率、勾配の評価回数の再設定
+)
+```
+<br>
+
+- モデル実装結果の確認
+```{r result }
+#mcmcサンプルの取得
+print(pax_seasonal_adj,
+      par = c("s_z","s_s","s_v","lp__"),
+      probs = c(0.025,0.5,0.975))
+
+mcmc_sample　<- rstan::extract(pax_seasonal_adj)
+#収束の確認
+mcmc_combo(pax_seasonal_adj, pars = c("s_z","s_s","s_v","lp__"))
+```
+<br>
+
+-結果の可視化
+```{r visu}
+#状態推定値(季節性+)の抜き出し
+result_df_alpha <- data.frame(t(apply(
+  X = mcmc_sample[["alpha"]],
+  MARGIN = 2,
+  FUN = quantile,
+  probs = c(0.025,0.5,0.975)
+)))
+
+#カラム名の変更
+colnames(result_df_alpha) <- c("alpha_lwr","alpha","alpha_upr")
+
+#実測値の代入
+result_df_alpha$month <- pax_int$month
+result_df_alpha$obs <- pax_int$pax_int
+
+#移動平均法での季節調整の結果
+result_df_alpha$mv_12 <- pax_int$mv_12
+
+
+#トレンド成分の抜き出し
+result_df_mu <- data.frame(t(apply(
+  X = mcmc_sample[["mu"]],
+  MARGIN = 2,
+  FUN = quantile,
+  probs = c(0.025,0.5,0.975)
+)))
+
+#カラム名の変更
+colnames(result_df_mu) <- c("mu_lwr","mu","mu_upr")
+
+#実測値
+result_df_mu$month <- pax_int$month
+
+
+#季節性成分の抜き出し
+result_df_gamma <- data.frame(t(apply(
+  X = mcmc_sample[["gamma"]],
+  MARGIN = 2,
+  FUN = quantile,
+  probs = c(0.025,0.5,0.975)
+)))
+
+#カラム名の変更
+colnames(result_df_gamma) <- c("gamma_lwr","gamma","gamma_upr")
+
+#実測値の代入
+result_df_gamma$month <- pax_int$month
+
+#結合
+result_df <- left_join(result_df_alpha,result_df_mu,  by = "month")
+result_df <- left_join(result_df,result_df_gamma, by= "month")
+
+#状態推定値
+alpha <- result_df %>% ggplot()+
+  geom_point(aes(x = month, y= obs))+
+  geom_line(aes(x = month, y= alpha))+
+  geom_ribbon(aes(x = month, y= alpha,
+                  ymin = alpha_lwr,ymax=alpha_upr),alpha = 0.3)+
+  scale_y_continuous(limits = c(0,25))+
+  labs(x = "月",y = "月間旅客数(100万人)",title = "状態推定値(α)")+
+  theme_gray (base_family = "HiraKakuPro-W3")+#mac使用のためフォント指定
+  theme(axis.text.x = element_text(angle = 75, vjust = 0.5))
+plot(alpha)
+#トレンド成分(季節調整値)
+mu <- result_df %>% ggplot()+
+  geom_point(aes(x = month, y= obs))+
+  geom_line(aes(x = month, y= mu))+
+  geom_ribbon(aes(x = month, y= mu,
+                  ymin = mu_lwr,ymax=mu_upr),alpha = 0.3)+
+  labs(title = "",y = "y",x="t")+
+  scale_y_continuous(limits = c(0,25))+
+  labs(x = "月",y = "月間旅客数(100万人)",title = "季節性調整済")+
+  theme_gray (base_family = "HiraKakuPro-W3")+#mac使用のためフォント指定
+  theme(axis.text.x = element_text(angle = 75, vjust = 0.5))
+
+plot(mu)
+#季節性成分の抽出
+gamma <- result_df %>% ggplot()+
+  geom_line(aes(x = month, y= gamma))+
+  geom_ribbon(aes(x = month, y= gamma,
+                  ymin = gamma_lwr,ymax=gamma_upr),alpha = 0.3)+
+  labs(y = "γ",x="time",title = "季節性成分(γ)")+
+  theme_gray (base_family = "HiraKakuPro-W3")
+
+plot(gamma)
+#12ヶ月移動平均との比較
+compara <- result_df %>% ggplot()+
+  geom_point(aes(x = month, y= obs))+
+  geom_line(aes(x = month, y= mu))+
+  geom_line(aes(x = month, y= mv_12),linetype = 2,color = "red")+
+  scale_y_continuous(limits = c(0,25))+
+  labs(title = "状態空間モデルと移動平均法による季節調整の比較",y = "月間旅客数(100万人)",x="月",caption = "実線:状態空間モデル,点線:12ヶ月移動平均")+
+  theme_gray (base_family = "HiraKakuPro-W3")+#mac使用のためフォント指定
+  theme(axis.text.x = element_text(angle = 75, vjust = 0.5))
+
+plot(compara)
+```
+<br>
+
+- 参考
+  - [実践Data Scienceシリーズ RとStanではじめる ベイズ統計モデリングによるデータ分析入門 (KS情報科学専門書)](https://www.kspub.co.jp/book/detail/5165362.html)
+  -  [RStan: the R interface to Stan](https://cran.r-project.org/web/packages/rstan/vignettes/rstan.html)
+  -  [米国交通統計局](https://www.transtats.bts.gov/Data_Elements.aspx)
